@@ -5,8 +5,9 @@ const moment = require('moment');
 const Twit = require('twit');
 const sql = require('sqlite3');
 const fs = require('fs');
+const type = require('content-type-mime');
 
-const TWEETS = `/tmp/${process.env.filename}`;
+const SOCIAL = `/tmp/${process.env.filename}`;
 const s3 = new aws.S3({ region: 'us-east-1' });
 
 const T = new Twit({
@@ -16,8 +17,8 @@ const T = new Twit({
   access_token_secret: process.env.access_token_secret,
 });
 
-const post = (status, mediaIdStr) => new Promise((resolve, reject) => {
-  const payload = { status, media_ids: mediaIdStr };
+const post = (status, mediaIdStr, reply) => new Promise((resolve, reject) => {
+  const payload = { status, media_ids: mediaIdStr, in_reply_to_status_id: reply };
   T.post('statuses/update', payload, (err, data) => {
     if (err) {
       reject(err);
@@ -27,7 +28,7 @@ const post = (status, mediaIdStr) => new Promise((resolve, reject) => {
   });
 });
 
-const saveToDB = tweets => new Promise((resolve, reject) => {
+const saveInstagram = info => new Promise((resolve, reject) => {
   s3.getObject({
     Bucket: process.env.dbBucket,
     Key: process.env.filename,
@@ -35,19 +36,64 @@ const saveToDB = tweets => new Promise((resolve, reject) => {
     if (err) {
       reject(err);
     }
-    fs.writeFileSync(TWEETS, data.Body);
-    const db = new sql.Database(TWEETS);
-    db.run('INSERT into tweets VALUES($tweet_id, $tweet, $date, $included_urls)', {
-      $tweet_id: tweets.id,
-      $tweet: tweets.text,
+    fs.writeFileSync(SOCIAL, data.Body);
+    const db = new sql.Database(SOCIAL);
+    db.run('INSERT into social VALUES($date, $post, $twitter, $instagram, $tweet_urls, $tweet_id, $instagram_id)', {
+      $date: moment().format('YYYY-MM-DD H:mm:ss Z'),
+      $post: info.text,
+      $twitter: 0,
+      $instagram: 1,
+      $tweet_urls: '',
+      $tweet_id: null,
+      $instagram_id: info.id,
+    }, function instagramSave(insertErr) {
+      if (insertErr) {
+        reject(insertErr);
+      } else {
+        console.log(this);
+        const Body = fs.readFileSync(SOCIAL);
+        const params = {
+          Bucket: process.env.dbBucket,
+          Key: process.env.filename,
+          Body,
+        };
+
+        s3.putObject(params, (putErr) => {
+          if (putErr) {
+            reject(putErr);
+          } else {
+            resolve();
+          }
+        });
+      }
+    });
+  });
+});
+
+const saveTweet = tweets => new Promise((resolve, reject) => {
+  s3.getObject({
+    Bucket: process.env.dbBucket,
+    Key: process.env.filename,
+  }, (err, data) => {
+    if (err) {
+      reject(err);
+    }
+    fs.writeFileSync(SOCIAL, data.Body);
+    const db = new sql.Database(SOCIAL);
+    db.run('INSERT into social VALUES($date, $post, $twitter, $instagram, $tweet_urls, $tweet_id, $instagram_id)', {
       $date: moment(tweets.created_at).format('YYYY-MM-DD H:mm:ss Z'),
-      $included_urls: JSON.stringify(tweets.entities.urls),
+      $post: tweets.text,
+      $twitter: 1,
+      $instagram: 0,
+      $tweet_urls: JSON.stringify(tweets.entities.urls),
+      $tweet_id: tweets.id,
+      $instagram_id: '',
     }, function tweetSave(insertErr) {
       if (insertErr) {
         reject(insertErr);
       } else {
         console.log(this);
-        const Body = fs.readFileSync(TWEETS);
+        const Body = fs.readFileSync(SOCIAL);
         const params = {
           Bucket: process.env.dbBucket,
           Key: process.env.filename,
@@ -81,11 +127,13 @@ const uploadImageToTwitter = (img, altText) => new Promise((resolve, reject) => 
   });
 });
 
-const uploadImageToS3 = (image, data) => new Promise((resolve, reject) => {
+const uploadImageToS3 = (image, Key, data) => new Promise((resolve, reject) => {
   const Body = new Buffer(image, 'base64');
   const params = {
     Bucket: process.env.mediaBucket,
-    Key: data.id_str,
+    ACL: 'public-read',
+    Key: `/images/social/${Key}`,
+    ContentType: type(Key),
     Body,
   };
 
@@ -93,23 +141,32 @@ const uploadImageToS3 = (image, data) => new Promise((resolve, reject) => {
     if (err) {
       reject(err);
     } else {
-      resolve(data);
+      resolve(data || {});
     }
   });
 });
 
 const tweet = (event, context, cb) => {
-  if (event.image) {
-    uploadImageToTwitter(event.image, event.alt)
-    .then(x => post(event.status, x))
-    .then(x => uploadImageToS3(event.image, x))
-    .then(x => saveToDB(x))
-    .then(() => cb(null, '🚀'))
-    .catch(err => cb(`🔥 ${JSON.stringify(err.stack)}`));
-  } else {
-    post(event.status)
-    .then(x => saveToDB(x))
-    .then(() => cb(null, '🚀'))
+  if (event.network === 'twitter') {
+    if (event.image) {
+      uploadImageToTwitter(event.image, event.alt)
+      .then(x => post(event.status, x, event.reply))
+      .then(x => uploadImageToS3(event.image, x.id_str, x))
+      .then(x => saveTweet(x))
+      .then(() => cb(null, '🚀'))
+      .catch(err => cb(`🔥 ${JSON.stringify(err.stack)}`));
+    } else {
+      post(event.status, '', event.reply)
+      .then(x => saveTweet(x))
+      .then(() => cb(null, '🚀'))
+      .catch(err => cb(`🔥 ${JSON.stringify(err.stack)}`));
+    }
+  }
+
+  if (event.network === 'instagram') {
+    uploadImageToS3(event.image, event.instagram_id)
+    .then(() => saveInstagram({ id: event.instagram_id, text: event.status }))
+    .then(() => cb(null, '✨'))
     .catch(err => cb(`🔥 ${JSON.stringify(err.stack)}`));
   }
 };
